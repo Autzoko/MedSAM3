@@ -55,7 +55,7 @@ echo ""
 export NCCL_IB_DISABLE=0
 export NCCL_DEBUG=WARN
 
-torchrun \
+python -m torch.distributed.run \
     --standalone \
     --nproc_per_node="${NUM_GPUS}" \
     finetune_abus.py \
