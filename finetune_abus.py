@@ -551,6 +551,7 @@ def train_one_epoch(
     rank: int = 0,
     accum_steps: int = 1,
     use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.float16,
     grad_clip: float = 0.1,
     log_interval: int = 10,
     text_prompt: str = "breast lesion",
@@ -574,7 +575,7 @@ def train_one_epoch(
         )
 
         with sync_context:
-            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = model(batched_dp)
                 targets = [raw_model.back_convert(t) for t in batched_dp.find_targets]
                 losses = loss_fn(outputs, targets)
@@ -619,11 +620,11 @@ def validate(
     dataloader: DataLoader,
     device: torch.device,
     use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.float16,
     text_prompt: str = "breast lesion",
 ) -> dict:
     raw_model = _get_raw_model(model)
     raw_model.eval()
-    total_loss = 0.0
     total_iou = 0.0
     n_batches = 0
     n_detected = 0
@@ -632,18 +633,9 @@ def validate(
     for batch in dataloader:
         batched_dp = to_device(batch, device)
 
-        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
             outputs = raw_model(batched_dp)
-            targets = [raw_model.back_convert(t) for t in batched_dp.find_targets]
-            # In eval mode, SAM3 skips _compute_matching so "indices" is
-            # missing from output dicts.  Populate it before computing loss.
-            for stage_outs in outputs:
-                for out in stage_outs:
-                    if "indices" not in out:
-                        raw_model._compute_matching(out, targets)
-            losses = loss_fn(outputs, targets)
 
-        total_loss += losses["core_loss"].item()
         n_batches += 1
 
         # Quick IoU check: best predicted box vs GT for each image
@@ -687,18 +679,17 @@ def validate(
     # Aggregate across GPUs in distributed mode
     if is_distributed():
         stats = torch.tensor(
-            [total_loss, total_iou, n_batches, n_detected, n_total],
+            [total_iou, n_batches, n_detected, n_total],
             dtype=torch.float64, device=device,
         )
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-        total_loss, total_iou, n_batches, n_detected, n_total = stats.tolist()
+        total_iou, n_batches, n_detected, n_total = stats.tolist()
         n_batches, n_detected, n_total = int(n_batches), int(n_detected), int(n_total)
 
-    avg_loss = total_loss / max(n_batches, 1)
     avg_iou = total_iou / max(n_total, 1)
     det_rate = n_detected / max(n_total, 1)
 
-    return {"val_loss": avg_loss, "val_iou": avg_iou, "det_rate": det_rate, "n_total": n_total}
+    return {"val_iou": avg_iou, "det_rate": det_rate, "n_total": n_total}
 
 
 def _compute_iou(a: list[float], b: list[float]) -> float:
@@ -830,6 +821,21 @@ def main():
         if is_primary(rank):
             log.info("Using CPU (finetuning will be very slow)")
     use_amp = torch.cuda.is_available() and not args.no_amp
+    # Choose AMP dtype: bfloat16 if hardware supports it (A100+), else fp16.
+    # bfloat16 has same exponent range as fp32 → much less overflow risk.
+    if use_amp and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+        use_grad_scaler = False  # bfloat16 doesn't need GradScaler
+        if is_primary(rank):
+            log.info("AMP dtype: bfloat16 (no GradScaler needed)")
+    elif use_amp:
+        amp_dtype = torch.float16
+        use_grad_scaler = True
+        if is_primary(rank):
+            log.info("AMP dtype: float16 (with GradScaler)")
+    else:
+        amp_dtype = torch.float32
+        use_grad_scaler = False
 
     # --- Data ---
     if is_primary(rank):
@@ -946,7 +952,7 @@ def main():
     )
 
     # --- AMP scaler ---
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
     # --- Resume ---
     start_epoch = 0
@@ -978,7 +984,7 @@ def main():
         avg_loss = train_one_epoch(
             model, loss_fn, train_loader, optimizer, scheduler, scaler,
             device, epoch, rank, args.accum_steps,
-            use_amp, args.grad_clip, args.log_interval, args.text_prompt,
+            use_amp, amp_dtype, args.grad_clip, args.log_interval, args.text_prompt,
         )
         dt = time.time() - t0
 
@@ -988,12 +994,11 @@ def main():
         # Validation
         if (epoch + 1) % args.val_freq == 0 or epoch == args.epochs - 1:
             val_metrics = validate(
-                model, loss_fn, val_loader, device, use_amp, args.text_prompt
+                model, loss_fn, val_loader, device, use_amp, amp_dtype, args.text_prompt
             )
             if is_primary(rank):
                 log.info(
-                    f"  VAL  loss={val_metrics['val_loss']:.4f}  "
-                    f"IoU={val_metrics['val_iou']:.4f}  "
+                    f"  VAL  IoU={val_metrics['val_iou']:.4f}  "
                     f"det@0.1={val_metrics['det_rate']:.1%}  "
                     f"({val_metrics['n_total']} samples)"
                 )
