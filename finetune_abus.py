@@ -628,6 +628,12 @@ def validate(
         with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
             outputs = raw_model(batched_dp)
             targets = [raw_model.back_convert(t) for t in batched_dp.find_targets]
+            # In eval mode, SAM3 skips _compute_matching so "indices" is
+            # missing from output dicts.  Populate it before computing loss.
+            for stage_outs in outputs:
+                for out in stage_outs:
+                    if "indices" not in out:
+                        raw_model._compute_matching(out, targets)
             losses = loss_fn(outputs, targets)
 
         total_loss += losses["core_loss"].item()
