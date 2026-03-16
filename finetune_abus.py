@@ -853,6 +853,21 @@ def main():
         load_from_HF=False,
         enable_segmentation=True,  # paper trains with segmentation head
     )
+
+    # Initialize segmentation head / scoring layers that are missing from the
+    # pretrained checkpoint (randomly initialized → can produce NaN under bf16).
+    # Use small Xavier init so outputs start near zero.
+    _init_count = 0
+    for name, param in model.named_parameters():
+        if "segmentation_head" in name or "dot_prod_scoring" in name:
+            if param.dim() >= 2:
+                nn.init.xavier_uniform_(param, gain=0.01)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+            _init_count += 1
+    if _init_count > 0 and is_primary(rank):
+        log.info(f"Re-initialized {_init_count} segmentation/scoring params (not in checkpoint)")
+
     model = model.to(device)
 
     if is_primary(rank):
