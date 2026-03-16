@@ -573,22 +573,35 @@ def train_one_epoch(
                 losses = loss_fn(outputs, targets)
                 core_loss = losses["core_loss"] / accum_steps
 
-            if torch.isnan(core_loss) or torch.isinf(core_loss):
-                log.warning(f"  Step {i}: NaN/Inf loss, skipping")
-                continue
-
+            # Let GradScaler handle NaN/Inf — it will skip the optimizer step
+            # and reduce the scale factor. Do NOT `continue` as that breaks DDP sync.
             scaler.scale(core_loss).backward()
 
         if is_last_accum:
             scaler.unscale_(optimizer)
+            # Check for NaN/Inf gradients — zero them out to prevent model corruption
+            nan_grad = False
+            for p in model.parameters():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    nan_grad = True
+                    break
+            if nan_grad:
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                if is_primary(rank):
+                    log.warning(f"  Step {i}: NaN/Inf gradients, skipping update")
+                continue
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-        total_loss += core_loss.item() * accum_steps  # undo the /accum_steps for logging
-        n_batches += 1
+        loss_val = core_loss.item() * accum_steps
+        if not (math.isnan(loss_val) or math.isinf(loss_val)):
+            total_loss += loss_val
+            n_batches += 1
 
         if is_primary(rank) and i % log_interval == 0:
             cur_lr = optimizer.param_groups[0]["lr"]
@@ -775,19 +788,19 @@ def main():
                         help="Per-GPU batch size")
     parser.add_argument("--accum-steps", type=int, default=1,
                         help="Gradient accumulation steps (effective BS = batch-size * accum-steps * num-GPUs)")
-    parser.add_argument("--lr", type=float, default=3e-4,
-                        help="LR for transformer decoder (paper: 3e-4)")
-    parser.add_argument("--lr-vision", type=float, default=5e-5,
-                        help="Base LR for vision backbone before LLRD (paper: 5e-5)")
-    parser.add_argument("--lr-language", type=float, default=5e-5,
-                        help="LR for language backbone (paper: 5e-5)")
-    parser.add_argument("--lr-geometry", type=float, default=1e-4,
-                        help="LR for geometry encoder (paper: 1e-4)")
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="LR for transformer decoder (finetuning default; paper: 3e-4)")
+    parser.add_argument("--lr-vision", type=float, default=1e-5,
+                        help="Base LR for vision backbone before LLRD (finetuning default; paper: 5e-5)")
+    parser.add_argument("--lr-language", type=float, default=1e-5,
+                        help="LR for language backbone (finetuning default; paper: 5e-5)")
+    parser.add_argument("--lr-geometry", type=float, default=3e-5,
+                        help="LR for geometry encoder (finetuning default; paper: 1e-4)")
     parser.add_argument("--lrd", type=float, default=0.85,
                         help="Layer-wise learning rate decay for vision backbone (paper: 0.85)")
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=0.1)
-    parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--val-freq", type=int, default=2,
                         help="Validate every N epochs")
     parser.add_argument("--num-workers", type=int, default=4)
