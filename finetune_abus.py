@@ -567,7 +567,7 @@ def train_one_epoch(
         )
 
         with sync_context:
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
                 outputs = model(batched_dp)
                 targets = [raw_model.back_convert(t) for t in batched_dp.find_targets]
                 losses = loss_fn(outputs, targets)
@@ -624,7 +624,7 @@ def validate(
     for batch in dataloader:
         batched_dp = to_device(batch, device)
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp):
             outputs = raw_model(batched_dp)
             targets = [raw_model.back_convert(t) for t in batched_dp.find_targets]
             losses = loss_fn(outputs, targets)
