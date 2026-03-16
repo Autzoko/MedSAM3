@@ -75,8 +75,25 @@ from sam3.model.data_misc import (
 )
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.loss.loss_fns import Boxes, IABCEMdetr, Masks
+from sam3.train import matcher as _matcher_module
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.optim.schedulers import InverseSquareRootParamScheduler
+
+# ---------------------------------------------------------------------------
+# Monkey-patch SAM3's _do_matching to handle NaN/Inf in the cost matrix.
+# bfloat16 autocast can produce extreme values in early training steps,
+# causing linear_sum_assignment to crash with "invalid numeric entries".
+# ---------------------------------------------------------------------------
+_orig_do_matching = _matcher_module._do_matching
+
+def _safe_do_matching(cost, repeats=1, return_tgt_indices=False, do_filtering=False):
+    cost = np.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=-1e6)
+    return _orig_do_matching(cost, repeats=repeats,
+                             return_tgt_indices=return_tgt_indices,
+                             do_filtering=do_filtering)
+
+_matcher_module._do_matching = _safe_do_matching
+# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
