@@ -862,14 +862,33 @@ def main():
             bpe_path = str(candidate)
             break
 
+    # Build model WITHOUT loading checkpoint (SAM3's _load_checkpoint only loads
+    # keys containing "detector.", but Medical-SAM3 checkpoint has no prefix)
     model = build_sam3_image_model(
         bpe_path=bpe_path,
-        device=str(device),
+        device="cpu",  # load on CPU first
         eval_mode=False,
-        checkpoint_path=ckpt_path,
+        checkpoint_path=None,   # skip SAM3's broken loader
         load_from_HF=False,
-        enable_segmentation=False,  # checkpoint lacks segmentation weights
+        enable_segmentation=False,
     )
+
+    # Load checkpoint ourselves — handles both prefixed and unprefixed keys
+    if is_primary(rank):
+        log.info(f"Loading checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt["model"] if "model" in ckpt else ckpt
+    # Strip "detector." prefix if present, otherwise use keys as-is
+    has_detector_prefix = any(k.startswith("detector.") for k in state_dict)
+    if has_detector_prefix:
+        state_dict = {k.replace("detector.", ""): v for k, v in state_dict.items()
+                      if k.startswith("detector.")}
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if is_primary(rank):
+        if missing:
+            log.info(f"Checkpoint missing {len(missing)} keys (e.g. segmentation head)")
+        if unexpected:
+            log.info(f"Checkpoint has {len(unexpected)} unexpected keys")
 
     model = model.to(device)
 
