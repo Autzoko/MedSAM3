@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Data & model artifacts (too large for git)
+checkpoints/
+shards/
+shards_abus/
+finetune_output/
+results/viz/
+
+# Third-party cloned repos (cloned during install)
+third_party/sam3/
+third_party/Medical-SAM3/
+
+# Large files
+*.pt
+*.pth
+*.tar
+*.xlsx
+*.pdf
+
+# Eval run artifacts (root level)
+eval_full_log.txt
+eval_results_birads.json
+eval_summary_birads.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Logs
+logs/
+*.log
