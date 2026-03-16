@@ -35,6 +35,9 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Force unbuffered output so logs appear immediately under torchrun
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -98,7 +101,11 @@ _matcher_module._do_matching = _safe_do_matching
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
+    force=True,
 )
+# Ensure log output is flushed immediately (torchrun buffers stdout/stderr)
+for h in logging.root.handlers:
+    h.flush = h.stream.flush if hasattr(h, "stream") else h.flush
 log = logging.getLogger("finetune")
 
 
@@ -960,6 +967,8 @@ def main():
         log.info(f"Text prompt: \"{args.text_prompt}\", AMP: {use_amp}")
 
     for epoch in range(start_epoch, args.epochs):
+        if is_primary(rank):
+            log.info(f"=== Epoch {epoch + 1}/{args.epochs} ===")
         # Set epoch on sampler so each epoch shuffles differently
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
