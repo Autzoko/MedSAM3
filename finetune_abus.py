@@ -579,20 +579,8 @@ def train_one_epoch(
 
         if is_last_accum:
             scaler.unscale_(optimizer)
-            # Check for NaN/Inf gradients — zero them out to prevent model corruption
-            nan_grad = False
-            for p in model.parameters():
-                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
-                    nan_grad = True
-                    break
-            if nan_grad:
-                optimizer.zero_grad(set_to_none=True)
-                scaler.update()
-                if is_primary(rank):
-                    log.warning(f"  Step {i}: NaN/Inf gradients, skipping update")
-                continue
-
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            # GradScaler.step() auto-skips optimizer.step() if grads contain Inf/NaN
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()

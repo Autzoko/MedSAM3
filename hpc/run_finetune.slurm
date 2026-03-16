@@ -17,12 +17,12 @@ OUTPUT_DIR="${PROJECT_DIR}/finetune_output"
 PROMPT="breast lesion"
 EPOCHS=20
 BATCH_SIZE=1
-LR=3e-4
-LR_VISION=5e-5
-LR_LANGUAGE=5e-5
-LR_GEOMETRY=1e-4
+LR=1e-4
+LR_VISION=1e-5
+LR_LANGUAGE=1e-5
+LR_GEOMETRY=3e-5
 LRD=0.85
-WARMUP=50
+WARMUP=200
 VAL_FREQ=2
 # ────────────────────────────────────────────────────────────────────
 
