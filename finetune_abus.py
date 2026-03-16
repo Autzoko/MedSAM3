@@ -868,22 +868,8 @@ def main():
         eval_mode=False,
         checkpoint_path=ckpt_path,
         load_from_HF=False,
-        enable_segmentation=True,  # paper trains with segmentation head
+        enable_segmentation=False,  # checkpoint lacks segmentation weights
     )
-
-    # Initialize segmentation head / scoring layers that are missing from the
-    # pretrained checkpoint (randomly initialized → can produce NaN under bf16).
-    # Use small Xavier init so outputs start near zero.
-    _init_count = 0
-    for name, param in model.named_parameters():
-        if "segmentation_head" in name or "dot_prod_scoring" in name:
-            if param.dim() >= 2:
-                nn.init.xavier_uniform_(param, gain=0.01)
-            elif "bias" in name:
-                nn.init.zeros_(param)
-            _init_count += 1
-    if _init_count > 0 and is_primary(rank):
-        log.info(f"Re-initialized {_init_count} segmentation/scoring params (not in checkpoint)")
 
     model = model.to(device)
 
@@ -904,8 +890,8 @@ def main():
         if is_primary(rank):
             log.info(f"Model wrapped in DDP (world_size={world_size})")
 
-    # --- Loss (detection + segmentation, per paper) ---
-    loss_fn = build_loss(device, enable_segmentation=True, distributed=ddp)
+    # --- Loss (detection only — checkpoint lacks segmentation weights) ---
+    loss_fn = build_loss(device, enable_segmentation=False, distributed=ddp)
 
     # --- Optimizer (operates on unwrapped model params) ---
     optimizer = build_optimizer(
