@@ -9,14 +9,19 @@ WebDataset .tar shards. Matches the Medical SAM3 paper methodology:
   - BinaryOneToManyMatcher (DAC-DETR) for O2M matching
   - L_find (L1 + GIoU + focal-CE + presence) + L_seg (focal-mask + dice)
 
-Usage:
+Supports multi-GPU training via PyTorch DDP (torchrun).
+
+Usage (single GPU):
     python finetune_abus.py --shards shards_abus/ --checkpoint checkpoints/checkpoint.pt
-    python finetune_abus.py --shards shards_abus/ --checkpoint checkpoints/checkpoint.pt --epochs 20
+
+Usage (multi-GPU via torchrun):
+    torchrun --nproc_per_node=4 finetune_abus.py --shards shards_abus/ --checkpoint checkpoints/checkpoint.pt
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import logging
@@ -32,9 +37,12 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from PIL import Image, ImageEnhance
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 # ---------------------------------------------------------------------------
 # Path setup — must happen before SAM3 imports
@@ -75,6 +83,40 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
 )
 log = logging.getLogger("finetune")
+
+
+# ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
+def setup_distributed():
+    """Initialize DDP process group if launched via torchrun."""
+    if "RANK" not in os.environ:
+        return 0, 0, 1  # local_rank, rank, world_size (single-GPU fallback)
+
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+
+    # Suppress logging on non-primary ranks
+    if rank != 0:
+        logging.getLogger("finetune").setLevel(logging.WARNING)
+
+    return local_rank, rank, world_size
+
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_primary(rank: int) -> bool:
+    return rank == 0
+
+
+def is_distributed() -> bool:
+    return dist.is_initialized() and dist.get_world_size() > 1
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +457,11 @@ def get_inverse_sqrt_schedule(
 # ---------------------------------------------------------------------------
 # Build loss function
 # ---------------------------------------------------------------------------
-def build_loss(device: torch.device, enable_segmentation: bool = True) -> Sam3LossWrapper:
+def build_loss(
+    device: torch.device,
+    enable_segmentation: bool = True,
+    distributed: bool = False,
+) -> Sam3LossWrapper:
     """Create loss matching Medical SAM3 paper (Table 2).
 
     L_find: L1(λ=5) + GIoU(λ=2) + focal-CE(λ=20) + presence(λ=20)
@@ -447,9 +493,13 @@ def build_loss(device: torch.device, enable_segmentation: bool = True) -> Sam3Lo
         threshold=0.4,
         topk=4,
     )
+
+    # "global" syncs num_boxes across GPUs via all_reduce; "local" is per-GPU
+    normalization = "global" if distributed else "local"
+
     loss_fn = Sam3LossWrapper(
         loss_fns_find=loss_fns,
-        normalization="local",  # single-GPU
+        normalization=normalization,
         o2m_matcher=o2m_matcher,
         o2m_weight=2.0,
     )
@@ -460,6 +510,11 @@ def build_loss(device: torch.device, enable_segmentation: bool = True) -> Sam3Lo
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+def _get_raw_model(model: nn.Module) -> nn.Module:
+    """Unwrap DDP to get the underlying model."""
+    return model.module if isinstance(model, DDP) else model
+
+
 def train_one_epoch(
     model: nn.Module,
     loss_fn: nn.Module,
@@ -469,6 +524,8 @@ def train_one_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     epoch: int,
+    rank: int = 0,
+    accum_steps: int = 1,
     use_amp: bool = True,
     grad_clip: float = 0.1,
     log_interval: int = 10,
@@ -477,38 +534,50 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
     n_batches = 0
+    raw_model = _get_raw_model(model)
+
+    optimizer.zero_grad(set_to_none=True)
 
     for i, batch in enumerate(dataloader):
         batched_dp = to_device(batch, device)
 
-        optimizer.zero_grad(set_to_none=True)
+        # Gradient accumulation: skip gradient sync on non-final micro-steps
+        is_last_accum = (i + 1) % accum_steps == 0 or (i + 1) == len(dataloader)
+        sync_context = (
+            contextlib.nullcontext()
+            if is_last_accum or not isinstance(model, DDP)
+            else model.no_sync()
+        )
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-            outputs = model(batched_dp)
-            targets = [model.back_convert(t) for t in batched_dp.find_targets]
-            losses = loss_fn(outputs, targets)
-            core_loss = losses["core_loss"]
+        with sync_context:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                outputs = model(batched_dp)
+                targets = [raw_model.back_convert(t) for t in batched_dp.find_targets]
+                losses = loss_fn(outputs, targets)
+                core_loss = losses["core_loss"] / accum_steps
 
-        if torch.isnan(core_loss) or torch.isinf(core_loss):
-            log.warning(f"  Step {i}: NaN/Inf loss, skipping")
+            if torch.isnan(core_loss) or torch.isinf(core_loss):
+                log.warning(f"  Step {i}: NaN/Inf loss, skipping")
+                continue
+
+            scaler.scale(core_loss).backward()
+
+        if is_last_accum:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            continue
 
-        scaler.scale(core_loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-
-        total_loss += core_loss.item()
+        total_loss += core_loss.item() * accum_steps  # undo the /accum_steps for logging
         n_batches += 1
 
-        if i % log_interval == 0:
+        if is_primary(rank) and i % log_interval == 0:
             cur_lr = optimizer.param_groups[0]["lr"]
             log.info(
                 f"  Epoch {epoch} [{i}/{len(dataloader)}]  "
-                f"loss={core_loss.item():.4f}  lr={cur_lr:.2e}"
+                f"loss={core_loss.item() * accum_steps:.4f}  lr={cur_lr:.2e}"
             )
 
     avg_loss = total_loss / max(n_batches, 1)
@@ -527,7 +596,8 @@ def validate(
     use_amp: bool = True,
     text_prompt: str = "breast lesion",
 ) -> dict:
-    model.eval()
+    raw_model = _get_raw_model(model)
+    raw_model.eval()
     total_loss = 0.0
     total_iou = 0.0
     n_batches = 0
@@ -538,27 +608,26 @@ def validate(
         batched_dp = to_device(batch, device)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-            outputs = model(batched_dp)
-            targets = [model.back_convert(t) for t in batched_dp.find_targets]
+            outputs = raw_model(batched_dp)
+            targets = [raw_model.back_convert(t) for t in batched_dp.find_targets]
             losses = loss_fn(outputs, targets)
 
         total_loss += losses["core_loss"].item()
         n_batches += 1
 
         # Quick IoU check: best predicted box vs GT for each image
-        # outputs is SAM3Output; get the last step of the first (only) stage
-        stage_out = list(outputs)[0]  # list of steps for stage 0
+        stage_out = list(outputs)[0]
         if isinstance(stage_out, list):
-            step_out = stage_out[-1]  # last step
+            step_out = stage_out[-1]
         else:
             step_out = stage_out
 
-        pred_boxes_xyxy = step_out.get("pred_boxes_xyxy")  # [B, Q, 4]
-        pred_logits = step_out.get("pred_logits")           # [B, Q, 1]
+        pred_boxes_xyxy = step_out.get("pred_boxes_xyxy")
+        pred_logits = step_out.get("pred_logits")
 
         if pred_boxes_xyxy is not None and pred_logits is not None:
             B = pred_logits.shape[0]
-            gt_boxes = batched_dp.find_targets[0].boxes  # packed cxcywh
+            gt_boxes = batched_dp.find_targets[0].boxes
 
             offset = 0
             for b in range(B):
@@ -567,11 +636,9 @@ def validate(
                     offset += n_gt
                     continue
 
-                # Best prediction (highest logit)
                 best_q = pred_logits[b, :, 0].argmax().item()
-                pred = pred_boxes_xyxy[b, best_q].cpu()  # xyxy normalised
+                pred = pred_boxes_xyxy[b, best_q].cpu()
 
-                # GT: convert cxcywh → xyxy
                 gt = gt_boxes[offset].cpu()
                 gt_xyxy = torch.tensor([
                     gt[0] - gt[2] / 2, gt[1] - gt[3] / 2,
@@ -585,6 +652,16 @@ def validate(
                     n_detected += 1
 
                 offset += n_gt
+
+    # Aggregate across GPUs in distributed mode
+    if is_distributed():
+        stats = torch.tensor(
+            [total_loss, total_iou, n_batches, n_detected, n_total],
+            dtype=torch.float64, device=device,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total_loss, total_iou, n_batches, n_detected, n_total = stats.tolist()
+        n_batches, n_detected, n_total = int(n_batches), int(n_detected), int(n_total)
 
     avg_loss = total_loss / max(n_batches, 1)
     avg_iou = total_iou / max(n_total, 1)
@@ -617,9 +694,10 @@ def save_checkpoint(
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Save model state with "detector." prefix for compatibility with SAM3's
-    # checkpoint loader (used by inference.py and evaluate_webdataset.py)
-    state_dict = model.state_dict()
+    # Unwrap DDP before saving
+    raw_model = _get_raw_model(model)
+    state_dict = raw_model.state_dict()
+    # Add "detector." prefix for compatibility with SAM3's checkpoint loader
     compat_state_dict = {f"detector.{k}": v for k, v in state_dict.items()}
 
     torch.save(
@@ -650,7 +728,8 @@ def load_resume_checkpoint(
     stripped = {
         k.replace("detector.", ""): v for k, v in state_dict.items()
     }
-    model.load_state_dict(stripped, strict=False)
+    raw_model = _get_raw_model(model)
+    raw_model.load_state_dict(stripped, strict=False)
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
     scaler.load_state_dict(ckpt["scaler"])
@@ -675,7 +754,10 @@ def main():
                         help="Resume training from this checkpoint")
     # Training
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Per-GPU batch size")
+    parser.add_argument("--accum-steps", type=int, default=1,
+                        help="Gradient accumulation steps (effective BS = batch-size * accum-steps * num-GPUs)")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="LR for transformer decoder (paper: 3e-4)")
     parser.add_argument("--lr-vision", type=float, default=5e-5,
@@ -699,28 +781,42 @@ def main():
     parser.add_argument("--no-amp", action="store_true", help="Disable AMP")
 
     args = parser.parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Distributed setup ---
+    local_rank, rank, world_size = setup_distributed()
+    ddp = world_size > 1
+
+    if is_primary(rank):
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Device ---
     if torch.cuda.is_available():
-        device = torch.device("cuda")
-        log.info(f"Using CUDA: {torch.cuda.get_device_name(0)}")
+        device = torch.device("cuda", local_rank)
+        if is_primary(rank):
+            log.info(f"Using {world_size} GPU(s): {torch.cuda.get_device_name(local_rank)}")
     else:
         device = torch.device("cpu")
-        log.info("Using CPU (finetuning will be very slow)")
+        if is_primary(rank):
+            log.info("Using CPU (finetuning will be very slow)")
     use_amp = torch.cuda.is_available() and not args.no_amp
 
     # --- Data ---
-    log.info("Loading training data from shards...")
+    if is_primary(rank):
+        log.info("Loading training data from shards...")
     train_ds = ABUSShardDataset(args.shards, split="train", augment=True)
     val_ds = ABUSShardDataset(args.shards, split="val", augment=False)
 
     collate_fn = lambda batch: collate_abus(batch, text_prompt=args.text_prompt)
 
+    # Use DistributedSampler for multi-GPU
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(val_ds, shuffle=False) if ddp else None
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),  # mutually exclusive with sampler
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
@@ -730,16 +826,17 @@ def main():
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         collate_fn=collate_fn,
     )
 
     # --- Model ---
-    log.info("Building SAM3 model...")
+    if is_primary(rank):
+        log.info("Building SAM3 model...")
     ckpt_path = args.checkpoint or str(ROOT / "checkpoints" / "checkpoint.pt")
     bpe_path = None
-    # Try to find BPE vocab
     for candidate in [
         ROOT / "third_party" / "sam3" / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz",
         ROOT / "third_party" / "Medical-SAM3" / "inference" / "sam3" / "assets" / "bpe_simple_vocab_16e6.txt.gz",
@@ -750,25 +847,37 @@ def main():
 
     model = build_sam3_image_model(
         bpe_path=bpe_path,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=str(device),
         eval_mode=False,
         checkpoint_path=ckpt_path,
         load_from_HF=False,
         enable_segmentation=True,  # paper trains with segmentation head
     )
     model = model.to(device)
-    model.train()
 
-    n_params = sum(p.numel() for p in model.parameters())
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info(f"Model: {n_params / 1e6:.1f}M params, {n_trainable / 1e6:.1f}M trainable")
+    if is_primary(rank):
+        n_params = sum(p.numel() for p in model.parameters())
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        log.info(f"Model: {n_params / 1e6:.1f}M params, {n_trainable / 1e6:.1f}M trainable")
+
+    # --- Wrap in DDP ---
+    if ddp:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+            broadcast_buffers=False,
+        )
+        if is_primary(rank):
+            log.info(f"Model wrapped in DDP (world_size={world_size})")
 
     # --- Loss (detection + segmentation, per paper) ---
-    loss_fn = build_loss(device, enable_segmentation=True)
+    loss_fn = build_loss(device, enable_segmentation=True, distributed=ddp)
 
-    # --- Optimizer ---
+    # --- Optimizer (operates on unwrapped model params) ---
     optimizer = build_optimizer(
-        model,
+        _get_raw_model(model),
         lr=args.lr,
         lr_vision=args.lr_vision,
         lr_language=args.lr_language,
@@ -778,7 +887,8 @@ def main():
     )
 
     # --- Scheduler (inverse-square-root, per Medical SAM3 paper) ---
-    total_steps = len(train_loader) * args.epochs
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * args.epochs
     scheduler = get_inverse_sqrt_schedule(
         optimizer, args.warmup_steps, total_steps,
         cooldown_steps=0, timescale=10000,
@@ -798,48 +908,67 @@ def main():
             )
 
     # --- Training loop ---
-    log.info(f"Training for {args.epochs} epochs, {len(train_loader)} steps/epoch")
-    log.info(f"Text prompt: \"{args.text_prompt}\", AMP: {use_amp}")
+    if is_primary(rank):
+        eff_bs = args.batch_size * args.accum_steps * world_size
+        log.info(f"Training for {args.epochs} epochs, {steps_per_epoch} steps/epoch")
+        log.info(f"Per-GPU BS={args.batch_size}, accum={args.accum_steps}, "
+                 f"GPUs={world_size} → effective BS={eff_bs}")
+        log.info(f"Text prompt: \"{args.text_prompt}\", AMP: {use_amp}")
 
     for epoch in range(start_epoch, args.epochs):
+        # Set epoch on sampler so each epoch shuffles differently
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         t0 = time.time()
 
         avg_loss = train_one_epoch(
             model, loss_fn, train_loader, optimizer, scheduler, scaler,
-            device, epoch, use_amp, args.grad_clip, args.log_interval,
-            args.text_prompt,
+            device, epoch, rank, args.accum_steps,
+            use_amp, args.grad_clip, args.log_interval, args.text_prompt,
         )
         dt = time.time() - t0
-        log.info(f"Epoch {epoch} done — avg_loss={avg_loss:.4f}  time={dt:.0f}s")
+
+        if is_primary(rank):
+            log.info(f"Epoch {epoch} done — avg_loss={avg_loss:.4f}  time={dt:.0f}s")
 
         # Validation
         if (epoch + 1) % args.val_freq == 0 or epoch == args.epochs - 1:
             val_metrics = validate(
                 model, loss_fn, val_loader, device, use_amp, args.text_prompt
             )
-            log.info(
-                f"  VAL  loss={val_metrics['val_loss']:.4f}  "
-                f"IoU={val_metrics['val_iou']:.4f}  "
-                f"det@0.1={val_metrics['det_rate']:.1%}  "
-                f"({val_metrics['n_total']} samples)"
-            )
-
-            # Save best
-            if val_metrics["val_iou"] > best_iou:
-                best_iou = val_metrics["val_iou"]
-                save_checkpoint(
-                    model, optimizer, scheduler, scaler, epoch, best_iou,
-                    args.output_dir / "best_checkpoint.pt",
+            if is_primary(rank):
+                log.info(
+                    f"  VAL  loss={val_metrics['val_loss']:.4f}  "
+                    f"IoU={val_metrics['val_iou']:.4f}  "
+                    f"det@0.1={val_metrics['det_rate']:.1%}  "
+                    f"({val_metrics['n_total']} samples)"
                 )
 
-        # Save latest
-        save_checkpoint(
-            model, optimizer, scheduler, scaler, epoch, best_iou,
-            args.output_dir / "latest_checkpoint.pt",
-        )
+                # Save best
+                if val_metrics["val_iou"] > best_iou:
+                    best_iou = val_metrics["val_iou"]
+                    save_checkpoint(
+                        model, optimizer, scheduler, scaler, epoch, best_iou,
+                        args.output_dir / "best_checkpoint.pt",
+                    )
 
-    log.info(f"Training complete. Best val IoU: {best_iou:.4f}")
-    log.info(f"Checkpoints in {args.output_dir}/")
+        # Save latest (rank 0 only)
+        if is_primary(rank):
+            save_checkpoint(
+                model, optimizer, scheduler, scaler, epoch, best_iou,
+                args.output_dir / "latest_checkpoint.pt",
+            )
+
+        # Sync all ranks before next epoch
+        if ddp:
+            dist.barrier()
+
+    if is_primary(rank):
+        log.info(f"Training complete. Best val IoU: {best_iou:.4f}")
+        log.info(f"Checkpoints in {args.output_dir}/")
+
+    cleanup_distributed()
 
 
 if __name__ == "__main__":
