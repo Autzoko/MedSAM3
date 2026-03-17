@@ -581,16 +581,22 @@ def train_one_epoch(
                 losses = loss_fn(outputs, targets)
                 core_loss = losses["core_loss"] / accum_steps
 
-            # Let GradScaler handle NaN/Inf — it will skip the optimizer step
-            # and reduce the scale factor. Do NOT `continue` as that breaks DDP sync.
-            scaler.scale(core_loss).backward()
+            # Skip backward if loss is NaN/Inf — prevents corrupting model weights.
+            # We still run a dummy backward (zeros) so DDP gradient sync doesn't hang.
+            loss_ok = torch.isfinite(core_loss).item()
+            if loss_ok:
+                scaler.scale(core_loss).backward()
+            else:
+                # Zero-out gradients for this micro-step (DDP still syncs zeros)
+                dummy = sum(p.sum() * 0.0 for p in model.parameters() if p.requires_grad)
+                dummy.backward()
 
         if is_last_accum:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-            # GradScaler.step() auto-skips optimizer.step() if grads contain Inf/NaN
-            scaler.step(optimizer)
-            scaler.update()
+            if loss_ok:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
