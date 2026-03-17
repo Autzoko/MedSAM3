@@ -587,20 +587,16 @@ def train_one_epoch(
 
         if is_last_accum:
             scaler.unscale_(optimizer)
-            # Check for NaN/Inf grads — zero them to protect model weights
-            has_nan_grad = any(
-                p.grad is not None and not torch.isfinite(p.grad).all()
-                for p in model.parameters()
-            )
-            if has_nan_grad:
-                optimizer.zero_grad(set_to_none=True)
-                scaler.update()
-                if is_primary(rank) and i % log_interval == 0:
-                    log.info(f"  Step {i}: NaN/Inf grads — skipped update")
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+            # Replace NaN/Inf grads with zeros — don't skip the entire update,
+            # just protect the affected parameters while still updating the rest.
+            for p in model.parameters():
+                if p.grad is not None:
+                    nan_mask = ~torch.isfinite(p.grad)
+                    if nan_mask.any():
+                        p.grad[nan_mask] = 0.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
