@@ -130,6 +130,16 @@ class MedSAM3:
         # torch is loaded (by _choose_device) but before sam3 import
         _install_stubs()
 
+        # Ensure sam3_inference.py can resolve the BPE vocab path by setting
+        # SAM3_ROOT before it gets imported.  sam3_inference uses __file__-
+        # relative paths which break when CWD != project root.
+        import sam3_inference as _si
+        _sam3_root = _SAM3_DIR.resolve()
+        if (_sam3_root / "sam3").is_dir():
+            _si.SAM3_ROOT = _sam3_root
+            if str(_sam3_root) not in sys.path:
+                sys.path.insert(0, str(_sam3_root))
+
         # Import the upstream inference helper
         try:
             from sam3_inference import SAM3Model
