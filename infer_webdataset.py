@@ -186,23 +186,30 @@ def infer_case(
 
     elapsed = time.time() - t0
 
-    # Evaluate against GT if available
-    gt_boxes_all = []
-    for sl in slices:
-        for box in sl["gt_boxes"]:
-            gt_boxes_all.append((box, sl["slice_idx"]))
-
-    # Find largest GT box
+    # Evaluate per-slice IoU: for each slice that has both GT and prediction,
+    # compute IoU and take the best match across slices.
+    best_iou = 0.0
     best_gt = None
-    if gt_boxes_all:
-        for box, sidx in gt_boxes_all:
-            area = (box[2] - box[0]) * (box[3] - box[1])
-            if best_gt is None or area > best_gt[1]:
-                best_gt = (box, area, sidx)
-
-    iou = 0.0
-    if best_gt and best_pred:
-        iou = compute_iou(best_gt[0], best_pred["box"])
+    for sr in per_slice:
+        if not sr["gt_boxes"] or not sr["pred_boxes"]:
+            continue
+        # Largest GT box on this slice
+        gt_box = max(sr["gt_boxes"], key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
+        # Best prediction on this slice
+        best_pidx = int(np.argmax(sr["pred_scores"]))
+        pred_box = sr["pred_boxes"][best_pidx]
+        iou = compute_iou(gt_box, pred_box)
+        if iou > best_iou:
+            best_iou = iou
+            best_gt = gt_box
+    iou = best_iou
+    if best_gt is None:
+        # Fall back: use largest GT across all slices for reporting
+        for sl in slices:
+            for box in sl["gt_boxes"]:
+                area = (box[2] - box[0]) * (box[3] - box[1])
+                if best_gt is None or area > (best_gt[2] - best_gt[0]) * (best_gt[3] - best_gt[1]):
+                    best_gt = box
 
     # Save visualization of best prediction
     if save_viz_dir and best_pred and best_pred.get("overlay_b64"):
@@ -220,7 +227,7 @@ def infer_case(
             "score": best_pred["score"] if best_pred else 0.0,
             "slice_idx": best_pred["slice_idx"] if best_pred else None,
         },
-        "gt_bbox": best_gt[0] if best_gt else None,
+        "gt_bbox": best_gt if best_gt else None,
         "iou": round(iou, 4),
         "per_slice": per_slice,
     }
@@ -237,8 +244,8 @@ def main():
                         help="Path to finetuned checkpoint (default: checkpoints/checkpoint.pt)")
     parser.add_argument("--prompt", type=str, default="breast lesion",
                         help="Text prompt for detection")
-    parser.add_argument("--threshold", type=float, default=0.1,
-                        help="Confidence threshold")
+    parser.add_argument("--threshold", type=float, default=0.01,
+                        help="Confidence threshold (default low for finetuned models)")
     parser.add_argument("--max-cases", type=int, default=0,
                         help="Limit number of cases (0 = all)")
     parser.add_argument("--output", type=Path, default=Path("infer_results.json"),

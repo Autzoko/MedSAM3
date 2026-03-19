@@ -184,6 +184,9 @@ class MedSAM3:
                 bpe_path=str(_bpe_path),
                 checkpoint_path=None,
                 load_from_HF=False,
+                # enable_segmentation=True (default) — needed for Sam3Processor.
+                # Seg head has random weights (finetuning used False), but we
+                # only use box predictions. Masks will be unreliable.
             )
             self._model._load_custom_checkpoint(self.checkpoint_path)
         else:

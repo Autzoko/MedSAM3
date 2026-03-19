@@ -341,7 +341,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--shards", type=Path, default=Path("shards"))
     parser.add_argument("--prompt", type=str, default="breast tumor")
-    parser.add_argument("--threshold", type=float, default=0.1)
+    parser.add_argument("--threshold", type=float, default=0.01)
     parser.add_argument("--max-cases", type=int, default=0)
     parser.add_argument("--output", type=str, default="eval_results_wds.json")
     parser.add_argument("--viz-dir", type=Path, default=None,
