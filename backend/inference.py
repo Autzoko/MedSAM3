@@ -130,15 +130,29 @@ class MedSAM3:
         # torch is loaded (by _choose_device) but before sam3 import
         _install_stubs()
 
-        # Ensure sam3_inference.py can resolve the BPE vocab path by setting
-        # SAM3_ROOT before it gets imported.  sam3_inference uses __file__-
-        # relative paths which break when CWD != project root.
-        import sam3_inference as _si
-        _sam3_root = _SAM3_DIR.resolve()
-        if (_sam3_root / "sam3").is_dir():
-            _si.SAM3_ROOT = _sam3_root
-            if str(_sam3_root) not in sys.path:
-                sys.path.insert(0, str(_sam3_root))
+        # Find the BPE vocab file — search known locations
+        _bpe_name = "bpe_simple_vocab_16e6.txt.gz"
+        _bpe_candidates = [
+            _SAM3_DIR / "sam3" / "assets" / _bpe_name,
+            _SAM3_DIR / "assets" / _bpe_name,
+            _MEDSAM3_DIR / "inference" / "sam3" / "assets" / _bpe_name,
+        ]
+        _bpe_path = None
+        for c in _bpe_candidates:
+            if c.exists():
+                _bpe_path = c.resolve()
+                break
+        if _bpe_path is None:
+            # Search recursively as last resort
+            found = list(_ROOT.rglob(_bpe_name))
+            if found:
+                _bpe_path = found[0].resolve()
+        if _bpe_path is None:
+            raise FileNotFoundError(
+                f"Cannot find {_bpe_name}. Searched:\n"
+                + "\n".join(f"  {c}" for c in _bpe_candidates)
+            )
+        logger.info(f"BPE vocab: {_bpe_path}")
 
         # Import the upstream inference helper
         try:
@@ -149,6 +163,16 @@ class MedSAM3:
                 "Make sure you ran install.sh and the Medical-SAM3 repo is "
                 "cloned into third_party/Medical-SAM3."
             ) from exc
+
+        # Monkey-patch SAM3_ROOT so sam3_inference.load_model finds BPE.
+        # sam3_inference tries SAM3_ROOT/sam3/assets/ then SAM3_ROOT/assets/.
+        # Set SAM3_ROOT so one of those resolves to the found BPE file.
+        import sam3_inference as _si
+        _assets_dir = _bpe_path.parent          # .../assets/
+        if _assets_dir.parent.name == "sam3":
+            _si.SAM3_ROOT = _assets_dir.parent.parent  # .../sam3/sam3/assets → SAM3_ROOT=.../sam3
+        else:
+            _si.SAM3_ROOT = _assets_dir.parent          # .../assets → SAM3_ROOT=.../ (fallback path)
 
         self._model = SAM3Model(
             confidence_threshold=self.confidence_threshold,
