@@ -143,7 +143,6 @@ class MedSAM3:
                 _bpe_path = c.resolve()
                 break
         if _bpe_path is None:
-            # Search recursively as last resort
             found = list(_ROOT.rglob(_bpe_name))
             if found:
                 _bpe_path = found[0].resolve()
@@ -154,9 +153,9 @@ class MedSAM3:
             )
         logger.info(f"BPE vocab: {_bpe_path}")
 
-        # Import the upstream inference helper
+        # Import helpers
         try:
-            from sam3_inference import SAM3Model
+            from sam3_inference import SAM3Model, Sam3Processor
         except ImportError as exc:
             raise ImportError(
                 f"Cannot import sam3_inference: {exc}\n"
@@ -164,22 +163,43 @@ class MedSAM3:
                 "cloned into third_party/Medical-SAM3."
             ) from exc
 
-        # Monkey-patch SAM3_ROOT so sam3_inference.load_model finds BPE.
-        # sam3_inference tries SAM3_ROOT/sam3/assets/ then SAM3_ROOT/assets/.
-        # Set SAM3_ROOT so one of those resolves to the found BPE file.
-        import sam3_inference as _si
-        _assets_dir = _bpe_path.parent          # .../assets/
-        if _assets_dir.parent.name == "sam3":
-            _si.SAM3_ROOT = _assets_dir.parent.parent  # .../sam3/sam3/assets → SAM3_ROOT=.../sam3
-        else:
-            _si.SAM3_ROOT = _assets_dir.parent          # .../assets → SAM3_ROOT=.../ (fallback path)
+        import torch
+        from sam3 import build_sam3_image_model
+
+        # Build model ourselves with the correct BPE path (bypasses
+        # sam3_inference.load_model which has broken relative path resolution)
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
 
         self._model = SAM3Model(
             confidence_threshold=self.confidence_threshold,
             device=self.device,
             checkpoint_path=self.checkpoint_path,
         )
-        self._model.load_model()
+
+        if self.checkpoint_path:
+            self._model.model = build_sam3_image_model(
+                bpe_path=str(_bpe_path),
+                checkpoint_path=None,
+                load_from_HF=False,
+            )
+            self._model._load_custom_checkpoint(self.checkpoint_path)
+        else:
+            self._model.model = build_sam3_image_model(
+                bpe_path=str(_bpe_path),
+                checkpoint_path=None,
+                load_from_HF=True,
+            )
+
+        self._model.model = self._model.model.to(self.device)
+        self._model.model.eval()
+        self._model.processor = Sam3Processor(
+            self._model.model,
+            device=self.device,
+            confidence_threshold=self.confidence_threshold,
+        )
 
         dt = time.time() - t0
         logger.info(f"Model loaded in {dt:.1f}s on {self.device}")
